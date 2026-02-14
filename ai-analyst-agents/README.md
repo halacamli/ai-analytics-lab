@@ -1,6 +1,6 @@
 ## ✨ AI-powered SQL Review Tool
 
-![SQL Reviewer Demo](https://github.com/halacamli/ai-analytics-lab/blob/main/ai-analyst-agents/sql-reviewer/sql_reviewer_demo.gif)
+![SQL Reviewer Demo](demo.gif)
 
 # AI SQL Reviewer Agent
 

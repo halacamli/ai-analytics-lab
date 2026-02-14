@@ -1,137 +1,117 @@
 ## Summary (TL;DR)
 - Verdict: Needs fixes
-- Biggest risk: The join condition and WHERE clause cause an inner join effect and likely incorrect revenue attribution, leading to data loss and duplication.
-- Quick win: Move the purchase timestamp filter into the JOIN condition and clarify join logic to avoid filtering out sessions without purchases.
+- Biggest risk: The join and filter logic cause unintended row multiplication and incorrect revenue aggregation.
+- Quick win: Move the purchase timestamp filter into the JOIN condition and aggregate purchases before joining to sessions.
 
 ## A) Correctness & Edge Cases
+- Join cardinality and duplication (severity: High)  
+  - Evidence: The LEFT JOIN is on user_id only, and then the WHERE clause filters on p.purchase_ts >= s.event_ts. This WHERE clause effectively turns the LEFT JOIN into an INNER JOIN and can cause multiple purchases per session to multiply session rows, inflating the COUNT(DISTINCT s.session_id) and SUM(p.amount).  
+  - Fix: Move the purchase timestamp filter into the JOIN condition to preserve LEFT JOIN semantics. Also, consider aggregating purchases per user and session or per user and event_ts to avoid row multiplication.
 
-- **Incorrect join and filter logic causing data loss** (severity: High)  
-  - Evidence:  
-    The query uses a LEFT JOIN from sessions to purchases but then filters on `p.purchase_ts >= s.event_ts` in the WHERE clause. Since `p.purchase_ts` is from the right table, this condition excludes all rows where `p.purchase_ts` is NULL (i.e., sessions without purchases), effectively turning the LEFT JOIN into an INNER JOIN and losing sessions with zero revenue.  
-  - Fix:  
-    Move the purchase timestamp filter into the JOIN condition:  
-    ```sql
-    LEFT JOIN purchases p
-      ON s.user_id = p.user_id AND p.purchase_ts >= s.event_ts
-    ```
-    This preserves sessions without purchases and correctly associates purchases occurring at or after the session event timestamp.
+- Filter placement and logic (severity: High)  
+  - Evidence: The WHERE clause includes `p.purchase_ts >= s.event_ts` which filters out rows where p.purchase_ts is NULL (i.e., no purchase), negating the LEFT JOIN effect.  
+  - Fix: Change to `LEFT JOIN ... ON s.user_id = p.user_id AND p.purchase_ts >= s.event_ts` and remove the WHERE filter on p.purchase_ts.
 
-- **Potential duplication of revenue due to join cardinality** (severity: High)  
-  - Evidence:  
-    If a user has multiple sessions and multiple purchases, joining on `user_id` with a condition on timestamps but no session-to-purchase linkage risks multiplying purchase amounts across sessions. For example, a purchase could join to multiple sessions if `p.purchase_ts >= s.event_ts` matches multiple sessions per user.  
-  - Fix:  
-    Clarify the business logic: Are purchases attributed to sessions? If yes, is the purchase linked to the closest session before the purchase? If not, consider aggregating purchases separately and joining at the user level or using a more precise session-to-purchase mapping (e.g., purchase timestamp between session start and end).  
-    Without session end timestamps, this is ambiguous. Stakeholder questions below.
+- Time boundaries and timezone assumptions (severity: Medium)  
+  - Evidence: The event_ts filter is `>= TIMESTAMP('2026-01-01')` but no timezone is specified. BigQuery TIMESTAMP literals are UTC by default. If event_ts is stored in UTC, this is fine; otherwise, clarify timezone.  
+  - Fix: Confirm event_ts timezone or use TIMESTAMP with timezone if needed.
 
-- **No handling of nulls or zero revenue** (severity: Medium)  
-  - Evidence:  
-    `SUM(p.amount)` will return NULL if no purchases exist for a user. This can be misleading.  
-  - Fix:  
-    Use `COALESCE(SUM(p.amount), 0)` to ensure zero revenue is shown for users without purchases.
+- Null handling and aggregation (severity: Medium)  
+  - Evidence: SUM(p.amount) will be NULL if no matching purchases exist. This may cause confusion.  
+  - Fix: Use `COALESCE(SUM(p.amount), 0)` to return zero revenue when no purchases.
 
-- **Time boundaries and timezone assumptions unclear** (severity: Medium)  
-  - Evidence:  
-    `event_ts >= TIMESTAMP('2026-01-01')` uses a literal timestamp without timezone context. BigQuery TIMESTAMP is UTC by default, but if event_ts is in a different timezone or stored as DATETIME, this could cause mismatches.  
-  - Fix:  
-    Confirm event_ts timezone and clarify in comments. Use `TIMESTAMP('2026-01-01 00:00:00 UTC')` explicitly if needed.
-
-- **No partition pruning or filtering on purchases** (severity: Low)  
-  - Evidence:  
-    Purchases CTE selects all rows without filtering on purchase_ts. If dataset is large, this scans unnecessary data.  
-  - Fix:  
-    Add a filter on purchase_ts to limit data scanned, e.g., `WHERE purchase_ts >= '2026-01-01'` or relevant date range.
+- Missing join keys (severity: Medium)  
+  - Evidence: Joining only on user_id may cause incorrect matches if multiple sessions and purchases exist per user. There's no session-level or event-level join key to link purchases to sessions.  
+  - Fix: Clarify business logic: should purchases be linked to sessions by timestamp or session_id? If yes, consider joining on session_id or using a time window.
 
 ## B) Performance & Cost (BigQuery)
+- Filtering early (severity: Medium)  
+  - Evidence: The sessions CTE filters event_ts >= '2026-01-01', which is good. However, purchases CTE has no filter, potentially scanning all purchases.  
+  - Fix: If possible, filter purchases on purchase_ts >= '2026-01-01' or a relevant date to reduce scanned data.
 
-- Avoid SELECT * in CTEs (OK here, explicit columns used)  
-- Filter early: sessions filtered on event_ts, good. Purchases unfiltered, could be improved.  
-- Join on user_id only: could be large join; consider clustering or partitioning on user_id in source tables for performance.  
-- No CROSS JOIN or QUALIFY used, no issues.  
-- Aggregation after join may cause data explosion if join is many-to-many; fix join logic to reduce data scanned.
+- Avoid SELECT * (severity: Low)  
+  - Evidence: The query does not use SELECT *, which is good.
+
+- Join efficiency (severity: Medium)  
+  - Evidence: Joining large tables on user_id only can be expensive and cause data explosion.  
+  - Fix: Consider pre-aggregating purchases per user or session before join.
+
+- Use of QUALIFY (severity: Low)  
+  - Not applicable here.
 
 ## C) Readability & Maintainability
+- CTE naming (severity: Low)  
+  - "sessions" and "purchases" are clear.
 
-- CTE names `sessions` and `purchases` are clear and appropriate.  
-- Aliasing is consistent (`s`, `p`).  
-- No comments explaining business logic or assumptions; add comments especially around join logic and timestamp filters.  
-- Use explicit column names in SELECT and avoid `GROUP BY 1` for clarity: `GROUP BY s.user_id`.  
-- Consider renaming `event_ts` to `session_start_ts` if that is the meaning, for clarity.
+- Aliasing (severity: Low)  
+  - Aliases s and p are standard and clear.
+
+- Comments (severity: Medium)  
+  - No comments explaining the join logic or business assumptions.  
+  - Fix: Add comments explaining why purchases are joined on user_id and filtered by timestamp.
 
 ## D) Analytical Clarity
-
 **What this query returns:**  
-Counts distinct sessions per user starting from 2026-01-01 and sums purchase amounts for purchases occurring at or after the session event timestamp, joined by user_id.
+Counts distinct sessions per user since 2026-01-01 and sums purchase amounts for purchases occurring on or after each session's event timestamp.
 
 **Primary metrics:**  
 - Number of sessions per user  
-- Total revenue per user (from purchases linked by user_id and timestamp condition)
+- Total revenue per user linked to sessions
 
 **Assumptions:**  
-- Purchases are attributed to sessions by user_id and purchase timestamp >= session event timestamp.  
-- Sessions and purchases share the same timezone or timestamps are comparable as-is.  
-- Each purchase can be linked to multiple sessions if timestamps overlap, or the logic is acceptable as-is.
+- Purchases are linked to sessions by user_id and purchase timestamp >= session event timestamp  
+- event_ts and purchase_ts are comparable timestamps in the same timezone  
+- No session-level purchase linkage beyond user_id and timestamp
 
 **Top risks:**  
-1. Revenue duplication or inflation due to many-to-many join between sessions and purchases.  
-2. Loss of sessions without purchases due to WHERE clause filtering on right table columns.  
-3. Unclear time boundaries and timezone assumptions leading to incorrect filtering.
+1. Revenue double counting due to join multiplicity  
+2. Sessions count inflation due to join row duplication  
+3. Misinterpretation of purchase-session linkage logic
 
 **Questions to ask the stakeholder:**  
-- How should purchases be attributed to sessions? Is there a session end timestamp or session window?  
-- Should purchases before a session be excluded? What about purchases during or after sessions?  
-- What timezone are event_ts and purchase_ts in? Are they comparable directly?  
-- Should users with zero purchases still appear with zero revenue?  
-- What is the business meaning of `purchase_ts >= event_ts`? Is it correct to join on this condition?
+- Should purchases be linked to sessions strictly by user_id and purchase_ts >= event_ts?  
+- Is it possible for a purchase to be linked to multiple sessions? If yes, is that intended?  
+- What is the timezone of event_ts and purchase_ts?  
+- Should revenue be attributed to the first session after purchase or all sessions after purchase?  
+- Is there a session_id or other key in purchases to join on?
 
 ## Suggested revised SQL (optional)
 
-Assuming the goal is to count sessions per user and sum all purchases per user occurring on or after 2026-01-01, without session-level attribution:
+Assuming the goal is to count sessions per user and sum purchases that occur on or after the session event timestamp, but avoid row multiplication:
 
-```sql
-WITH sessions AS (
-  SELECT user_id, session_id
-  FROM `project.dataset.events`
-  WHERE event_ts >= TIMESTAMP('2026-01-01 00:00:00 UTC')
-),
-purchases AS (
-  SELECT user_id, amount
-  FROM `project.dataset.purchases`
-  WHERE purchase_ts >= TIMESTAMP('2026-01-01 00:00:00 UTC')
-)
-SELECT
-  s.user_id,
-  COUNT(DISTINCT s.session_id) AS sessions,
-  COALESCE(SUM(p.amount), 0) AS revenue
-FROM sessions s
-LEFT JOIN purchases p
-  ON s.user_id = p.user_id
-GROUP BY s.user_id
-```
-
-If purchase attribution to sessions is required, more info is needed to define session boundaries and join logic.
-
----
-
-If you want to keep the original logic but fix the join filtering issue:
+Option 1: Aggregate purchases per user and event_ts first, then join
 
 ```sql
 WITH sessions AS (
   SELECT user_id, session_id, event_ts
   FROM `project.dataset.events`
-  WHERE event_ts >= TIMESTAMP('2026-01-01 00:00:00 UTC')
+  WHERE event_ts >= TIMESTAMP('2026-01-01')
 ),
 purchases AS (
   SELECT user_id, purchase_ts, amount
   FROM `project.dataset.purchases`
+  WHERE purchase_ts >= TIMESTAMP('2026-01-01')  -- filter early if possible
+),
+purchases_per_session AS (
+  SELECT
+    s.user_id,
+    s.session_id,
+    s.event_ts,
+    SUM(p.amount) AS session_revenue
+  FROM sessions s
+  LEFT JOIN purchases p
+    ON s.user_id = p.user_id
+    AND p.purchase_ts >= s.event_ts
+  GROUP BY s.user_id, s.session_id, s.event_ts
 )
 SELECT
-  s.user_id,
-  COUNT(DISTINCT s.session_id) AS sessions,
-  COALESCE(SUM(p.amount), 0) AS revenue
-FROM sessions s
-LEFT JOIN purchases p
-  ON s.user_id = p.user_id AND p.purchase_ts >= s.event_ts
-GROUP BY s.user_id
+  user_id,
+  COUNT(DISTINCT session_id) AS sessions,
+  COALESCE(SUM(session_revenue), 0) AS revenue
+FROM purchases_per_session
+GROUP BY user_id;
 ```
 
-But beware of potential revenue duplication as noted.
+This approach sums purchases per session, avoiding row multiplication, then aggregates per user.
+
+If the business logic requires a different linkage, clarify before revising further.
