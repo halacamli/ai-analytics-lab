@@ -1,3 +1,7 @@
+## ✨ AI-powered SQL Review Tool
+
+![SQL Reviewer Demo](ai-analyst-agents/sql-reviewer/sql_reviewer_demo.gif)
+
 # AI SQL Reviewer Agent
 
 An AI-powered tool that reviews SQL queries for correctness, performance, and analytical risks.
